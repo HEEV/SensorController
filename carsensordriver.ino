@@ -1,5 +1,8 @@
 #include <DS18B20.h>
+#include <stdint.h>
 
+const uint8_t HEADER_1 = 0xAA;
+const uint8_t HEADER_2 = 0x55;
 //wheel speed constants
 #define wheelSpeedSensorPin 2
 #define numMagnets 1
@@ -13,8 +16,7 @@ volatile unsigned long magnetTimes[2] = { 0 }; // volatile modifier due to write
 volatile unsigned long deltaTime = 0;
 volatile unsigned long curTime = 0;
 volatile float distTraveled = 0;
-float currSpeed = 0;
-float prevSpeed = 0;
+float speed = 0;
 
 // Airspeed sensor variables
 float airOffset = 0.0f;  // Variable to hold the 0-speed pressure
@@ -34,24 +36,42 @@ int cacheLife[] = {0, 0};
 // unsigned int  = 2 bytes
 // float         = 4 bytes
 
+
 struct __attribute__((packed)) DataPacket {
-  // Hardcoded sensors/values (common across vehicles)
-  float         speed;
-  float         airspeed;
-  float         engineTemp;
-  float         radTemp;
-  // Digital Channels
-  unsigned char channel0;
-  unsigned char channel1;
-  unsigned char channel2;
-  unsigned char channel3;
-  unsigned char channel4;
-  // Analog Channels
-  unsigned int  channelA0; // 10-bit ADC
+  float speed;
+  float airspeed;
+  float engineTemp;
+  float radTemp;
+  uint8_t channel0;
+  uint8_t channel1;
+  uint8_t channel2;
+  uint8_t channel3;
+  uint8_t channel4;
+  uint16_t channelA0;
 };
 
+uint8_t packetChecksum(const uint8_t *data, size_t length) {
+  uint8_t checksum = 0;
+
+  for (size_t i = 0; i < length; i++) {
+    checksum ^= data[i];
+  }
+
+  return checksum;
+}
+
+void sendPacket(const DataPacket &packet) {
+  const uint8_t *payload = (const uint8_t *)&packet;
+  uint8_t checksum = packetChecksum(payload, sizeof(DataPacket));
+
+  Serial.write(HEADER_1);
+  Serial.write(HEADER_2);
+  Serial.write(payload, sizeof(DataPacket));
+  Serial.write(checksum);
+}
+
 void setup() {
-  Serial.begin(9600);  //Sets frequency value. - DO NOT CHANGE
+  Serial.begin(115200);  //Sets frequency value. - DO NOT CHANGE
 
   pinMode(wheelSpeedSensorPin, INPUT_PULLUP); // Wheelspeed, pin 2
   attachInterrupt(digitalPinToInterrupt(2), handleMagnet, FALLING); // wheelspeed interrupt
@@ -75,23 +95,27 @@ void setup() {
 
 void loop() {
   // Update speed values
-  prevSpeed = currSpeed;
-  currSpeed = getSpeed();
+  speed = getSpeed();
 
   // Update temperature cache values
   float engTemp = updateEngineTemp();
   float radTemp = updateRadiatorTemp();
 
-  struct DataPacket packet = {
-    currSpeed, ((float)analogRead(2) - airOffset), engTemp, radTemp, 
-    (unsigned char)digitalRead(4), (unsigned char)digitalRead(5), (unsigned char)digitalRead(6), 
-    (unsigned char)digitalRead(7), (unsigned char)digitalRead(8), analogRead(7)
+  DataPacket packet = {
+    speed,
+    (float)analogRead(A2) - airOffset,
+    engTemp,
+    radTemp,
+    (uint8_t)digitalRead(4),
+    (uint8_t)digitalRead(5),
+    (uint8_t)digitalRead(6),
+    (uint8_t)digitalRead(7),
+    (uint8_t)digitalRead(8),
+    (uint16_t)analogRead(A7)
   };
 
-  // Output all data channels to the bus, whether they are connected or not. Parsing happens RPi side.
-  // The write call casts the packet to a pointer to a byte, which write then parses through.
-  if ((currSpeed != prevSpeed && currSpeed > 0.25) || currSpeed == 0 ) {// 0.25 mph is error bandwidth for noise 
-    Serial.write((uint8_t*)&packet, sizeof(packet));
+  if (speed > 0.25f || speed == 0.0f) {
+    sendPacket(packet);
   }
 
   delay(50); 
@@ -109,8 +133,6 @@ void handleMagnet() {
 }
 
 float getSpeed() {
-  // Disable interrupts on reads of shared variables for atomicity
-  // noInterrupts();
 
   if (millis() - magnetTimes[0] < 3800 && magnetTimes[0] != 0) {
     // Calculating our speed based on the magnet timings
@@ -128,9 +150,6 @@ float getSpeed() {
 
     // Calculate speed in inches per second
     float inps = ((circumference / numMagnets) / deltaTime) * 1000.0f;
-
-    // Done accessing shared variables, re-enable interrupts
-    // interrupts();
 
     // convert the speed we calculated from Inches/Sec to Miles/Hr
     return ((inps / 12.0f) / 5280.0f) * 3600.0f;
