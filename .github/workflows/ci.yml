@@ -19,10 +19,13 @@ jobs:
           path: sketch/carsensordriver
 
       - name: Install arduino-cli
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
-            | sh -s -- -b /usr/local/bin
-          arduino-cli version
+        # the official action rather than the install script: the script
+        # reads its first positional argument as a version, so passing a
+        # bindir there makes it fetch arduino-cli_-b_Linux_64bit.tar.gz
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Show the version in use
+        run: arduino-cli version
 
       - name: Install the AVR core and libraries
         # DS18B20 needs OneWire, which it does not pull in itself
