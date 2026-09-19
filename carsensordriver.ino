@@ -1,8 +1,25 @@
 #include <DS18B20.h>
 #include <stdint.h>
 
-const uint8_t HEADER_1 = 0xAA;
-const uint8_t HEADER_2 = 0x55;
+/*
+ * The packet layout, the checksum, and the frame encoder live in the
+ * SensorHub library, which the Raspberry Pi uses to decode this. Sharing one
+ * definition is the whole point: the two ends cannot drift apart, because
+ * there is only one of them to edit.
+ *
+ * Install with:
+ *   arduino-cli lib install --git-url https://github.com/HEEV/SensorHub
+ *
+ * Only the encoder is linked here, about 90 bytes of flash more than the
+ * hand-rolled version it replaced. The receiving state machine comes along in
+ * the same header for whenever the Pi starts commanding the output channels
+ * on pins 10, 11, and 12.
+ */
+#include <SensorHub.h>
+
+/* Keep the local spelling so the call sites below read unchanged. */
+typedef sh_packet_t DataPacket;
+
 //wheel speed constants
 #define wheelSpeedSensorPin 2
 #define numMagnets 1
@@ -31,43 +48,14 @@ const uint8_t radTempAddr[8]    = { 0x28, 0xD0, 0xEB, 0x87, 0x00, 0xCA, 0x26, 0x
 const int cacheTTL[] = {50, 50};
 int cacheLife[] = {0, 0};
 
-// This is a struct with all padding bytes removed, which is used for efficient sending of data over the serial bus.
-// unsigned char = 1 byte
-// unsigned int  = 2 bytes
-// float         = 4 bytes
-
-
-struct __attribute__((packed)) DataPacket {
-  float speed;
-  float airspeed;
-  float engineTemp;
-  float radTemp;
-  uint8_t channel0;
-  uint8_t channel1;
-  uint8_t channel2;
-  uint8_t channel3;
-  uint8_t channel4;
-  uint16_t channelA0;
-};
-
-uint8_t packetChecksum(const uint8_t *data, size_t length) {
-  uint8_t checksum = 0;
-
-  for (size_t i = 0; i < length; i++) {
-    checksum ^= data[i];
-  }
-
-  return checksum;
-}
-
 void sendPacket(const DataPacket &packet) {
-  const uint8_t *payload = (const uint8_t *)&packet;
-  uint8_t checksum = packetChecksum(payload, sizeof(DataPacket));
+  /* One buffered write rather than four: header, payload, and checksum are
+     assembled by the shared encoder, so the Pi's decoder and this cannot
+     disagree about the format. */
+  uint8_t frame[SH_FRAME_SIZE];
 
-  Serial.write(HEADER_1);
-  Serial.write(HEADER_2);
-  Serial.write(payload, sizeof(DataPacket));
-  Serial.write(checksum);
+  sh_encode_frame(&packet, frame);
+  Serial.write(frame, sizeof(frame));
 }
 
 void setup() {

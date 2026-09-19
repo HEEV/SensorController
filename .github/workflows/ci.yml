@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    # the firmware is the one piece nobody can test without hardware, so at
+    # minimum prove it still compiles for the board it actually runs on, and
+    # report what it costs
+    name: compile for the Nano
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sketch/carsensordriver
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | sh -s -- -b /usr/local/bin
+          arduino-cli version
+
+      - name: Install the AVR core and libraries
+        # DS18B20 needs OneWire, which it does not pull in itself
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          arduino-cli lib install DS18B20
+          arduino-cli lib install OneWire
+
+      - name: Install SensorHub, which supplies the shared packet format
+        run: |
+          arduino-cli lib install --git-url https://github.com/HEEV/SensorHub || {
+            echo "falling back to a direct checkout"
+            git clone --depth 1 https://github.com/HEEV/SensorHub.git \
+              "$(arduino-cli config get directories.user)/libraries/SensorHub"
+          }
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn arduino:avr:nano:cpu=atmega328 \
+            --warnings all \
+            sketch/carsensordriver 2>&1 | tee /tmp/build.log
+
+      - name: Report flash and RAM use
+        # a Nano has 30720 bytes of flash and 2048 of RAM. running out is a
+        # real failure mode when someone adds a sensor, and it is much easier
+        # to notice here than at an event.
+        run: grep -E "Sketch uses|Global variables" /tmp/build.log
+
+      - name: Fail if the sketch no longer fits with room to spare
+        # 80% is the line; below that there is space for another sensor
+        run: |
+          used=$(grep -oE "Sketch uses [0-9]+" /tmp/build.log | grep -oE "[0-9]+")
+          pct=$(( used * 100 / 30720 ))
+          echo "flash: ${used} bytes, ${pct}% of a Nano"
+          if [ "$pct" -ge 80 ]; then
+            echo "over 80% of flash; time to think about what to cut"
+            exit 1
+          fi
