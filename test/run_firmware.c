@@ -62,13 +62,23 @@ int main(int argc, char **argv)
     }
 
     avr_init(avr);
-    avr->frequency = FREQ;
+    fw.frequency = FREQ;
     avr_load_firmware(avr, &fw);
+    avr->frequency = FREQ;
 
     out = fopen(argv[2], "wb");
     if (out == NULL) {
         perror(argv[2]);
         return 2;
+    }
+
+    /* Console echo off: it is a pretty-printer that substitutes '.' for
+       non-printable bytes, and we want the real ones. */
+    {
+        uint32_t flags = 0;
+        avr_ioctl(avr, AVR_IOCTL_UART_GET_FLAGS('0'), &flags);
+        flags &= (uint32_t)~AVR_UART_FLAG_STDIO;
+        avr_ioctl(avr, AVR_IOCTL_UART_SET_FLAGS('0'), &flags);
     }
 
     irq = avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'), UART_IRQ_OUTPUT);
@@ -90,8 +100,14 @@ int main(int argc, char **argv)
 
     fclose(out);
 
-    fprintf(stderr, "captured %ld bytes over %.3f s simulated\n", captured,
-            (double)avr->cycle / (double)FREQ);
+    /* Known limitation: capture stops after roughly 50 frames, whatever the
+       budget, because the AVR's TX ring fills and simavr does not drain it.
+       The firmware keeps running, wedged in HardwareSerial::write. So treat
+       the frame count as a sample, not as a rate: it says nothing about how
+       fast the loop runs, and comparing counts between builds measures where
+       the simulator stalls rather than anything about the code. */
+    fprintf(stderr, "captured %ld bytes, %.3f s simulated (stops early, see note)\n",
+            captured, (double)avr->cycle / (double)FREQ);
 
     if (captured == 0) {
         fprintf(stderr, "the firmware transmitted nothing\n");

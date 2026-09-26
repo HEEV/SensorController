@@ -3,20 +3,9 @@
 #include <string.h>
 #include <math.h>  /* NAN for a sensor that has never answered */
 
-/*
- * The packet layout, the checksum, and the frame encoder live in the
- * SensorHub library, which the Raspberry Pi uses to decode this. Sharing one
- * definition is the whole point: the two ends cannot drift apart, because
- * there is only one of them to edit.
- *
- * Install with:
- *   arduino-cli lib install --git-url https://github.com/HEEV/SensorHub
- *
- * Only the encoder is linked here, about 90 bytes of flash more than the
- * hand-rolled version it replaced. The receiving state machine comes along in
- * the same header for whenever the Pi starts commanding the output channels
- * on pins 10, 11, and 12.
- */
+/* Packet layout, checksum and frame encoder come from SensorHub, which the
+   Pi uses to decode this, so the two ends cannot drift apart.
+     arduino-cli lib install --git-url https://github.com/HEEV/SensorHub */
 #include <SensorHub.h>
 
 /* Keep the local spelling so the call sites below read unchanged. */
@@ -39,22 +28,10 @@ static uint16_t sequence = 0;
 #define circumference (2 * wheelRadius * PI) // in in 
 #define pulseDist (circumference / numMagnets) 
 
-/*
- * One magnet on the wheel means one sample per revolution, so the sensor
- * updates at about 10 Hz flat out and much slower everywhere else:
- *
- *    10 Hz  ->  35.7 mph     one sample every  100 ms
- *     2 Hz  ->   7.1 mph     one sample every  500 ms
- *   0.5 Hz  ->   1.8 mph     one sample every 2000 ms
- *
- * Two consequences. Speed is a whole-revolution average, not a 50 ms one, so
- * it cannot resolve a fast transient. And the loop sends at 20 Hz, so at best
- * every other packet repeats the previous speed.
- *
- * That is also why nothing in loop() may block for longer than one pulse
- * interval: a missed edge doubles the apparent pulse period and halves the
- * reported speed.
- */
+/* One magnet per revolution, so ~10 Hz flat out and slower elsewhere:
+     10 Hz -> 35.7 mph     2 Hz -> 7.1 mph     0.5 Hz -> 1.8 mph
+   Speed is a whole-revolution average and the loop sends at 20 Hz, so at
+   best every other packet repeats. Never block longer than one pulse. */
 #define SPEED_STALE_MS 3800UL  /* below ~0.94 mph, report a standstill */
 
 // other wheelspeed variables
@@ -73,36 +50,10 @@ DS18B20 ds(3);
 const uint8_t engineTempAddr[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 const uint8_t radTempAddr[8]    = { 0x28, 0xD0, 0xEB, 0x87, 0x00, 0xCA, 0x26, 0x82 };
 
-/*
- * Temperature polling: one sensor per cycle, at most every 100 ms.
- *
- * DS18B20::getTempF() is expensive in a way the call site does not show. It
- * issues CONVERT_T and then calls delayForConversion(), a blocking delay of
- * 750 ms at the library's default 12-bit resolution. Reading both sensors
- * inline every loop meant up to 1500 ms inside an iteration meant to turn
- * over in 50 ms, which is roughly 30 packets not sent.
- *
- * It does NOT lose wheel interrupts: Arduino's delay() spins on micros() with
- * interrupts enabled, so the magnet ISR keeps timestamping throughout. The
- * damage is to packet cadence, not to speed accuracy.
- *
- * Two changes bring the cost down by about 16x:
- *
- *   - 9-bit resolution. The conversion drops from 750 ms to 94 ms, and
- *     0.5 C is far finer than anything useful about coolant temperature.
- *   - One sensor per cycle, no more than every 100 ms, which is also the
- *     fastest the part can usefully be read.
- *
- * select() is not free either. Bus reset, ROM match, nine scratchpad bytes
- * and a power-mode query, with OneWire holding interrupts off around each bit
- * it times. Calling it twice per loop put all of that on the hot path; now it
- * happens once per 100 ms.
- *
- * Going fully non-blocking needs raw OneWire rather than this library, which
- * exposes no way to start a conversion and collect it later: getTempC(),
- * getTempF() and doConversion() all wait internally, and readScratchpad() is
- * private. That is a worthwhile follow-up, not a change to make blind.
- */
+/* getTempF() blocks: CONVERT_T then a 750 ms wait at 12-bit. Both sensors
+   inline every 50 ms loop cost ~30 packets. 9-bit and one sensor per 100 ms
+   cuts that ~16x. It never lost wheel interrupts: Arduino's delay() spins
+   with interrupts enabled. Fully async needs raw OneWire; no API for it. */
 #define TEMP_POLL_INTERVAL_MS 100UL  /* the part cannot do better than ~90 ms */
 #define TEMP_RESOLUTION       9      /* 94 ms conversion instead of 750 ms */
 #define TEMP_SENSOR_COUNT     2
@@ -111,17 +62,14 @@ static const uint8_t *const tempAddr[TEMP_SENSOR_COUNT] = {
   engineTempAddr, radTempAddr
 };
 
-/*
- * Last good reading per sensor. A sensor that has never answered reports NAN
- * rather than a stale or invented number.
- *
- * This matters: the previous code fell off the end of updateEngineTemp() and
- * updateRadiatorTemp() without returning a value on the cache-hit path, which
- * is undefined behaviour, and that path ran 50 times out of every 51. The
- * caller got whatever happened to be in the return register. A radiator
- * temperature frozen at exactly 48.4 in every CSV on the car is consistent
- * with a real early reading left sitting there and never updated again.
- */
+/* DS18B20::select() takes a non-const pointer it does not write through, so
+   the cast is the library's fault, not ours. Named once rather than inline. */
+static uint8_t selectSensor(uint8_t i) {
+  return ds.select((uint8_t *)tempAddr[i]);
+}
+
+/* NAN until a sensor answers. The old code fell off the end of these
+   functions and returned register contents, which looked like real data. */
 static float tempValue[TEMP_SENSOR_COUNT] = { NAN, NAN };
 static uint8_t tempIndex = 0;
 static unsigned long tempTimer = 0;
@@ -288,7 +236,7 @@ void serviceTemps() {
   }
   tempTimer = now;
 
-  if (ds.select((uint8_t *)tempAddr[tempIndex])) {
+  if (selectSensor(tempIndex)) {
     ds.setResolution(TEMP_RESOLUTION);
     tempValue[tempIndex] = ds.getTempF();
   } else {

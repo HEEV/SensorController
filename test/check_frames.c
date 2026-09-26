@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 int main(int argc, char **argv)
 {
@@ -69,32 +70,31 @@ int main(int argc, char **argv)
     printf("resyncs        %llu\n", (unsigned long long)parser.stats.resyncs);
     printf("dropped        %llu\n\n", (unsigned long long)parser.stats.dropped);
 
-    if (accepted < want) {
-        printf("FAIL: wanted at least %ld packets\n", want);
-        failures++;
-    }
-    if (parser.stats.checksum_errors != 0) {
-        printf("FAIL: the firmware emitted frames the parser could not verify\n");
-        failures++;
-    }
-    if (parser.stats.format_errors != 0) {
-        printf("FAIL: format byte disagreement between firmware and library\n");
-        failures++;
-    }
-    if (parser.stats.resyncs != 0) {
-        printf("FAIL: lost framing on a clean simulated link\n");
-        failures++;
-    }
-    if (parser.stats.dropped != 0) {
-        printf("FAIL: gap in the sequence numbers\n");
-        failures++;
-    }
+    {
+        /* A table, not six copies of one branch. The seventh check is data. */
+        const struct { bool bad; const char *why; } checks[] = {
+            { accepted < want,
+              "too few packets" },
+            { parser.stats.checksum_errors != 0,
+              "frames the parser could not verify" },
+            { parser.stats.format_errors != 0,
+              "format byte disagreement between firmware and library" },
+            { parser.stats.resyncs != 0,
+              "lost framing on a clean simulated link" },
+            { parser.stats.dropped != 0,
+              "gap in the sequence numbers" },
+            /* a clean run of N packets spans exactly N sequence numbers */
+            { accepted > 0 &&
+                  (uint16_t)(last - first) != (uint16_t)(accepted - 1),
+              "packet count and sequence span disagree" },
+        };
 
-    /* A clean run of N packets must span exactly N sequence numbers. */
-    if (accepted > 0 && (uint16_t)(last - first) != (uint16_t)(accepted - 1)) {
-        printf("FAIL: %ld packets but the sequence spans %u\n", accepted,
-               (unsigned)(uint16_t)(last - first + 1));
-        failures++;
+        for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+            if (checks[i].bad) {
+                printf("FAIL: %s\n", checks[i].why);
+                failures++;
+            }
+        }
     }
 
     if (failures == 0) {
