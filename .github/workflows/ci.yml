@@ -78,3 +78,76 @@ jobs:
             echo "over 80% of flash; time to think about what to cut"
             exit 1
           fi
+
+  simulate:
+    # Run the firmware on a simulated ATmega328p and require SensorHub's real
+    # parser to accept what it transmits.
+    #
+    # This is the test that would catch the wire format drifting on either
+    # side. Compiling both halves separately proves nothing about whether they
+    # agree; this feeds real transmitted bytes into the real decoder.
+    name: the firmware's output must decode
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: sketch/carsensordriver
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install the AVR core and libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          arduino-cli lib install DS18B20
+          arduino-cli lib install OneWire
+
+      - name: Install SensorHub
+        run: |
+          git clone --depth 1 https://github.com/HEEV/SensorHub.git \
+            "$(arduino-cli config get directories.user)/libraries/SensorHub"
+
+      - name: Install simavr
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y simavr libsimavr-dev libelf-dev
+
+      - name: Build the firmware
+        run: |
+          set -o pipefail
+          arduino-cli compile \
+            --fqbn arduino:avr:nano:cpu=atmega328 \
+            --output-dir /tmp/fw \
+            sketch/carsensordriver
+
+      - name: Build the harnesses
+        run: |
+          LIB="$(arduino-cli config get directories.user)/libraries/SensorHub"
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+             sketch/carsensordriver/test/run_firmware.c \
+             -lsimavr -lelf -o /tmp/run_firmware
+          cc -O2 -std=c11 -Wall -Wextra -Werror -I"$LIB/src" \
+             sketch/carsensordriver/test/check_frames.c \
+             "$LIB/src/sensorhub/parser.c" -o /tmp/check_frames
+
+      - name: Run three seconds of simulated car
+        # 3 s at 20 Hz is about 59 packets, and takes ~2 s of wall clock
+        run: /tmp/run_firmware /tmp/fw/*.elf /tmp/uart.bin 3000000
+
+      - name: Every frame must decode, with no gaps
+        run: /tmp/check_frames /tmp/uart.bin 50
+
+      - name: And the check must be able to fail
+        # a harness that cannot fail launders a guess into a green tick
+        run: |
+          python3 - <<'PY'
+          d = bytearray(open('/tmp/uart.bin','rb').read())
+          for i in range(2, len(d), 41):
+              d[i] ^= 0xFF          # corrupt every format byte
+          open('/tmp/uart_bad.bin','wb').write(bytes(d))
+          PY
+          if /tmp/check_frames /tmp/uart_bad.bin 50 > /dev/null 2>&1; then
+            echo "the check passed corrupted input; it is not checking anything"
+            exit 1
+          fi
+          echo "corrupted input correctly rejected"
