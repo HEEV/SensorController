@@ -37,11 +37,11 @@ jobs:
 
       - name: Install SensorHub, which supplies the shared packet format
         run: |
-          arduino-cli lib install --git-url https://github.com/HEEV/SensorHub || {
-            echo "falling back to a direct checkout"
-            git clone --depth 1 https://github.com/HEEV/SensorHub.git \
-              "$(arduino-cli config get directories.user)/libraries/SensorHub"
-          }
+          # a plain checkout rather than `lib install --git-url`: that flag is
+          # disabled unless library.enable_unsafe_install is turned on, so the
+          # git-url path could never have been the one doing the work
+          git clone --depth 1 https://github.com/HEEV/SensorHub.git \
+            "$(arduino-cli config get directories.user)/libraries/SensorHub"
           # a clone can succeed while producing something Arduino cannot use,
           # so check for the entry point rather than trusting the exit status
           lib="$(arduino-cli config get directories.user)/libraries/SensorHub"
