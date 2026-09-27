@@ -1,21 +1,11 @@
 #include <DS18B20.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>  /* NAN for a sensor that has never answered */
 
-/*
- * The packet layout, the checksum, and the frame encoder live in the
- * SensorHub library, which the Raspberry Pi uses to decode this. Sharing one
- * definition is the whole point: the two ends cannot drift apart, because
- * there is only one of them to edit.
- *
- * Install with:
- *   arduino-cli lib install --git-url https://github.com/HEEV/SensorHub
- *
- * Only the encoder is linked here, about 90 bytes of flash more than the
- * hand-rolled version it replaced. The receiving state machine comes along in
- * the same header for whenever the Pi starts commanding the output channels
- * on pins 10, 11, and 12.
- */
+/* Packet layout, checksum and frame encoder come from SensorHub, which the
+   Pi uses to decode this, so the two ends cannot drift apart.
+     arduino-cli lib install --git-url https://github.com/HEEV/SensorHub */
 #include <SensorHub.h>
 
 /* Keep the local spelling so the call sites below read unchanged. */
@@ -38,6 +28,12 @@ static uint16_t sequence = 0;
 #define circumference (2 * wheelRadius * PI) // in in 
 #define pulseDist (circumference / numMagnets) 
 
+/* One magnet per revolution, so ~10 Hz flat out and slower elsewhere:
+     10 Hz -> 35.7 mph     2 Hz -> 7.1 mph     0.5 Hz -> 1.8 mph
+   Speed is a whole-revolution average and the loop sends at 20 Hz, so at
+   best every other packet repeats. Never block longer than one pulse. */
+#define SPEED_STALE_MS 3800UL  /* below ~0.94 mph, report a standstill */
+
 // other wheelspeed variables
 volatile unsigned long magnetTimes[2] = { 0 }; // volatile modifier due to write in interrupt
 volatile unsigned long deltaTime = 0;
@@ -54,9 +50,30 @@ DS18B20 ds(3);
 const uint8_t engineTempAddr[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 const uint8_t radTempAddr[8]    = { 0x28, 0xD0, 0xEB, 0x87, 0x00, 0xCA, 0x26, 0x82 };
 
-// Index 0 is engine temp, index 1 is rad temp
-const int cacheTTL[] = {50, 50};
-int cacheLife[] = {0, 0};
+/* getTempF() blocks: CONVERT_T then a 750 ms wait at 12-bit. Both sensors
+   inline every 50 ms loop cost ~30 packets. 9-bit and one sensor per 100 ms
+   cuts that ~16x. It never lost wheel interrupts: Arduino's delay() spins
+   with interrupts enabled. Fully async needs raw OneWire; no API for it. */
+#define TEMP_POLL_INTERVAL_MS 100UL  /* the part cannot do better than ~90 ms */
+#define TEMP_RESOLUTION       9      /* 94 ms conversion instead of 750 ms */
+#define TEMP_SENSOR_COUNT     2
+
+static const uint8_t *const tempAddr[TEMP_SENSOR_COUNT] = {
+  engineTempAddr, radTempAddr
+};
+
+/* DS18B20::select() takes a non-const pointer it does not write through, so
+   the cast is the library's fault, not ours. Named once rather than inline. */
+static uint8_t selectSensor(uint8_t i) {
+  return ds.select((uint8_t *)tempAddr[i]);
+}
+
+/* NAN until a sensor answers. The old code fell off the end of these
+   functions and returned register contents, which looked like real data. */
+static float tempValue[TEMP_SENSOR_COUNT] = { NAN, NAN };
+static uint8_t tempIndex = 0;
+static unsigned long tempTimer = 0;
+
 
 void sendPacket(const DataPacket &packet) {
   /* One buffered write rather than four: header, version, length, payload,
@@ -100,9 +117,12 @@ void loop() {
   // Update speed values
   speed = getSpeed();
 
-  // Update temperature cache values
-  float engTemp = updateEngineTemp();
-  float radTemp = updateRadiatorTemp();
+  // Step the temperature poller: reads at most one sensor, and only every
+  // 100 ms, rather than both on every pass through here.
+  serviceTemps();
+
+  float engTemp = tempValue[0];
+  float radTemp = tempValue[1];
 
   DataPacket packet;
   memset(&packet, 0, sizeof(packet));
@@ -154,52 +174,77 @@ void handleMagnet() {
 }
 
 float getSpeed() {
+  unsigned long lastMagnet;
+  unsigned long delta;
 
-  if (millis() - magnetTimes[0] < 3800 && magnetTimes[0] != 0) {
-    // Calculating our speed based on the magnet timings
+  /*
+   * Snapshot both ISR variables with interrupts off.
+   *
+   * These are 32-bit on an 8-bit part, so a plain read is four separate byte
+   * loads. If handleMagnet() fires between them the result is half the old
+   * value and half the new one, which produces a speed that was never real.
+   * At 10 Hz the window is small but it is not zero, and a torn deltaTime
+   * shows up as an implausible spike rather than as an obvious fault.
+   */
+  noInterrupts();
+  lastMagnet = magnetTimes[0];
+  delta = deltaTime;
+  interrupts();
 
-    /*
-    current magnet setup (X is a magnet)
-      ***********
-     *     X     * 
-     *           *
-     *     O     *
-     *           *
-     *           *
-      ***********
-    */
-
-    // Calculate speed in inches per second
-    float inps = ((circumference / numMagnets) / deltaTime) * 1000.0f;
-
-    // convert the speed we calculated from Inches/Sec to Miles/Hr
-    return ((inps / 12.0f) / 5280.0f) * 3600.0f;
+  if (lastMagnet == 0) {
+    return 0.0f;   /* no magnet seen since boot */
   }
 
-  return 0.0;
+  if (millis() - lastMagnet >= SPEED_STALE_MS) {
+    return 0.0f;   /* stopped, or slower than about 0.94 mph */
+  }
+
+  if (delta == 0) {
+    return 0.0f;   /* guard the divide; debounce should prevent this */
+  }
+
+  /*
+   * current magnet setup (X is a magnet)
+   *   ***********
+   *  *     X     *
+   *  *           *
+   *  *     O     *
+   *  *           *
+   *  *           *
+   *   ***********
+   */
+
+  /* inches per second, then inches/sec -> miles/hour */
+  float inps = (pulseDist / (float)delta) * 1000.0f;
+  return ((inps / 12.0f) / 5280.0f) * 3600.0f;
 }
 
 // Get Temperatures, but only every so often because these sensors are slow.
 
-float updateEngineTemp() {
-  if (ds.select(engineTempAddr)){
-    if (cacheLife[0] > cacheTTL[0]) {
-      cacheLife[0] = 0;
-      return ds.getTempF();
-    } else { 
-      cacheLife[0]++; 
-    }
+/*
+ * Read one temperature sensor, at most every TEMP_POLL_INTERVAL_MS.
+ *
+ * Blocks for one 9-bit conversion, about 94 ms, when it does read. That is
+ * the best this library allows; see the note above. A sensor that does not
+ * select is left as NAN rather than reported as a plausible number.
+ */
+void serviceTemps() {
+  unsigned long now = millis();
+
+  if (now - tempTimer < TEMP_POLL_INTERVAL_MS) {
+    return;
   }
+  tempTimer = now;
+
+  if (selectSensor(tempIndex)) {
+    ds.setResolution(TEMP_RESOLUTION);
+    tempValue[tempIndex] = ds.getTempF();
+  } else {
+    /* Not on the bus. The engine probe's address is still all zeroes, so
+       this is its normal path. Report NAN, not an invented value. */
+    tempValue[tempIndex] = NAN;
+  }
+
+  tempIndex = (uint8_t)((tempIndex + 1) % TEMP_SENSOR_COUNT);
 }
 
-float updateRadiatorTemp() {
-  if (ds.select(radTempAddr)){
-    if (cacheLife[1] > cacheTTL[1]) {
-      cacheLife[1] = 0;
-      return ds.getTempF();
-    }
-    else { 
-      cacheLife[1]++; 
-    }
-  }
-}
