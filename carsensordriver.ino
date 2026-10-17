@@ -93,7 +93,7 @@ void sendPacket(const DataPacket &packet) {
 void setup() {
   Serial.begin(115200);  //Sets frequency value. - DO NOT CHANGE
 
-  pinMode(wheelSpeedSensorPin, INPUT_PULLUP); // Wheelspeed, pin 2
+  pinMode(wheelSpeedSensorPin, INPUT); // Wheelspeed, pin 2
   attachInterrupt(digitalPinToInterrupt(2), handleMagnet, FALLING); // wheelspeed interrupt
   pinMode(4, INPUT_PULLUP);
   pinMode(5, INPUT_PULLUP);
@@ -155,9 +155,7 @@ void loop() {
   // the Pi can know a packet never arrived; a checksum cannot tell it.
   packet.sequence = sequence++;
 
-  if (speed > 0.25f || speed == 0.0f) {
-    sendPacket(packet);
-  }
+  sendPacket(packet);
 
   delay(50); 
 }
