@@ -23,8 +23,8 @@ static uint16_t sequence = 0;
 //wheel speed constants
 #define wheelSpeedSensorPin 2
 #define numMagnets 1
-#define debounceTime 10 // in ms
-#define wheelRadius 10.0 // in in
+#define debounceTime 70 // in ms, car's max speed is 50mph
+#define wheelRadius 9.5 // in in
 #define circumference (2 * wheelRadius * PI) // in in 
 #define pulseDist (circumference / numMagnets) 
 
